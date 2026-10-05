@@ -1,0 +1,102 @@
+#!/usr/bin/python3
+#
+# third/gameservices: blazium.games/game and blazium.games/role message tags.
+# Servers add them to messages in bound game channels and relay them across
+# links; only clients with the blazium.games/tags cap see them; clients
+# cannot forge them.
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+# Only some clients have the cap, so lines differ in tags on purpose.
+m.disable_message_tags_check = 1
+c1a = m.new('c1a')
+c1b = m.new('c1b')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+m.connect()
+gs.require_module(m, c1a)
+
+for c in (c1a, c2a, c3a):
+    c.out("CAP REQ :blazium.games/tags")
+m.multisync()
+
+owner = gs.username("owner")
+p2 = gs.username("p2")
+p3 = gs.username("p3")
+plain = gs.username("plain")
+gs.login(m, c1a, owner)
+gs.login(m, c2a, p2)
+gs.login(m, c3a, p3)
+gs.login(m, c1b, plain)
+uid, chan = gs.asset(owners=[owner], licensed=[p2, p3, plain])
+gs.gamejoin(m, c1a, uid)
+gs.gamejoin(m, c2a, uid)
+gs.gamejoin(m, c1b, uid)
+
+# JOIN carries the tags, also across servers
+m.clearlog()
+gs.gamejoin(m, c3a, uid)
+v = m.expect_tag(c1a, "JOIN carries blazium.games/game", r":" + p3 + r"!\S+ JOIN", "blazium.games/game", timeout=5)
+if v != uid:
+    raise Exception("game tag on JOIN was %r" % v)
+v = m.expect_tag(c2a, "remote JOIN carries blazium.games/role", r":" + p3 + r"!\S+ JOIN", "blazium.games/role", timeout=5)
+if v != "chat":
+    raise Exception("role tag on JOIN was %r" % v)
+
+# PRIVMSG from the owner (irc1) to everyone
+m.clearlog()
+m.send(c1a, "PRIVMSG " + chan + " :owner speaking")
+for c in (c2a, c3a):
+    v = m.expect_tag(c, "PRIVMSG carries blazium.games/game", r"PRIVMSG " + chan + " :owner speaking", "blazium.games/game", timeout=5)
+    if v != uid:
+        raise Exception("game tag was %r" % v)
+    v = m.expect_tag(c, "PRIVMSG carries role owner", r"PRIVMSG " + chan + " :owner speaking", "blazium.games/role", timeout=5)
+    if v != "owner":
+        raise Exception("role tag was %r" % v)
+m.expect(c1b, "client without the cap gets the message", r"PRIVMSG " + chan + " :owner speaking", timeout=5)
+m.not_expect(c1b, "client without the cap gets no game tags", r"blazium\.games/")
+
+# PRIVMSG from irc2 reaches irc1 and irc3 with role chat
+m.clearlog()
+m.send(c2a, "PRIVMSG " + chan + " :player speaking")
+for c in (c1a, c3a):
+    v = m.expect_tag(c, "relayed PRIVMSG keeps role chat", r"PRIVMSG " + chan + " :player speaking", "blazium.games/role", timeout=5)
+    if v != "chat":
+        raise Exception("role tag was %r" % v)
+
+# Same message, same msgid and tags on every server
+m.clearlog()
+m.send(c3a, "NOTICE " + chan + " :consistency")
+lines = [gs.wait_for(m, c, r"NOTICE " + chan + " :consistency", timeout=5, what="notice delivered") for c in (c1a, c2a)]
+tags = [l.split(" ", 1)[0] for l in lines]
+strip = lambda t: ";".join(sorted(x for x in t[1:].split(";") if x.startswith(("msgid=", "blazium.games/"))))
+if strip(tags[0]) != strip(tags[1]):
+    raise Exception("tags differ across servers: %s vs %s" % (tags[0], tags[1]))
+print("\u2714 Test passed: msgid and game tags identical on irc1 and irc2")
+
+# PART carries the tags
+m.clearlog()
+m.send(c3a, "GAMEPART " + uid)
+v = m.expect_tag(c1a, "PART carries blazium.games/game", r":" + p3 + r"!\S+ PART " + chan, "blazium.games/game", timeout=5)
+if v != uid:
+    raise Exception("game tag on PART was %r" % v)
+
+# Non-game channels never get the tags
+other = m.randchan()
+for c in (c1a, c2a):
+    c.out("JOIN " + other)
+m.multisync()
+m.clearlog()
+m.send(c2a, "PRIVMSG " + other + " :ordinary")
+m.expect(c1a, "ordinary channel message", r"PRIVMSG " + other + " :ordinary", timeout=5)
+m.not_expect(c1a, "no game tags outside game channels", r"blazium\.games/.*PRIVMSG " + other)
+
+# Clients cannot set the tags
+m.clearlog()
+c2a.out("@blazium.games/game=" + uid + ";blazium.games/role=owner PRIVMSG " + other + " :forged")
+c2a.out("@+blazium.games/game=" + uid + " PRIVMSG " + other + " :forged-plus")
+m.multisync()
+m.expect(c1a, "forged message delivered", r"PRIVMSG " + other + " :forged$", timeout=5)
+m.not_expect(c1a, "client-sent game tags are dropped", r"blazium\.games/.*PRIVMSG " + other)

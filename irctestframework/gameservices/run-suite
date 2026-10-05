@@ -1,0 +1,164 @@
+#!/bin/bash
+#
+# Runs the Blazium third/gameservices suites against the 3-server test network.
+#
+#   irctestframework/gameservices/run-suite /path/to/gameservices.c [tests...]
+#
+# Optional environment:
+#   GS_OLD_SRC   an older gameservices.c; tests/modules/gameservices_upgrade_rehash
+#                loads it, then rehashes onto the new build with users online.
+#   CONDUIT_BIN  a conduit binary; tests/modules/gameservices_conduit drives it.
+#   UNREALIRCD_HOME  defaults to ~/unrealircd (built by extras/build-tests/nix/build).
+#
+# The module and its test config are removed again when the run ends, so a
+# later plain ./run behaves as before.
+#
+set -euo pipefail
+
+cd "$(dirname "$0")/../.."
+SUITE_ROOT="$(pwd)"
+
+if [ $# -lt 1 ] || [ ! -f "$1" ]; then
+	echo "usage: $0 /path/to/gameservices.c [tests...]" >&2
+	exit 2
+fi
+SRC="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+shift
+
+UHOME="${UNREALIRCD_HOME:-$HOME/unrealircd}"
+THIRD_SRC="$UHOME/source/src/modules/third"
+GS_WORK="${GS_WORK:-$HOME/.gameservices-tests}"
+export GS_WORK UNREALIRCD_HOME="$UHOME"
+mkdir -p "$GS_WORK"
+
+if [ ! -d "$THIRD_SRC" ] || [ ! -x "$UHOME/bin/unrealircd" ]; then
+	echo "UnrealIRCd is not installed in $UHOME (run extras/build-tests/nix/build first)" >&2
+	exit 2
+fi
+MAKE="${MAKE:-make}"
+
+# --- TLS: one CA for the mock API and the IRC servers' certificate ---------
+if [ ! -f "$GS_WORK/ca.pem" ]; then
+	openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=gameservices test CA" \
+		-keyout "$GS_WORK/ca.key" -out "$GS_WORK/ca.pem" \
+		-addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+fi
+# UnrealIRCd's url code matches hostnames with X509_check_host, which ignores
+# IP SANs, so 127.0.0.1 is also listed as a DNS name.
+if [ ! -f "$GS_WORK/server.pem" ] || ! grep -q 'DNS:127.0.0.1' "$GS_WORK/server.ext" 2>/dev/null; then
+	openssl req -newkey rsa:2048 -nodes -subj "/CN=localhost" \
+		-keyout "$GS_WORK/server.key" -out "$GS_WORK/server.csr" 2>/dev/null
+	printf 'subjectAltName=DNS:localhost,DNS:127.0.0.1,IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\n' > "$GS_WORK/server.ext"
+	openssl x509 -req -in "$GS_WORK/server.csr" -CA "$GS_WORK/ca.pem" -CAkey "$GS_WORK/ca.key" \
+		-CAcreateserial -days 3650 -extfile "$GS_WORK/server.ext" -out "$GS_WORK/server.pem" 2>/dev/null
+fi
+TLS="$UHOME/conf/tls"
+
+install_tls() {
+	for f in server.cert.pem server.key.pem; do
+		if [ -f "$TLS/$f" ] && [ ! -f "$TLS/$f.gs-orig" ]; then
+			cp -a "$TLS/$f" "$TLS/$f.gs-orig"
+		fi
+	done
+	install -m 0644 "$GS_WORK/server.pem" "$TLS/server.cert.pem"
+	install -m 0600 "$GS_WORK/server.key" "$TLS/server.key.pem"
+	local fp
+	fp="$(openssl x509 -in "$GS_WORK/ca.pem" -noout -fingerprint -sha256 | cut -d= -f2)"
+	if ! grep -qF "gameservices-test-ca $fp" "$TLS/curl-ca-bundle.crt" 2>/dev/null; then
+		{ printf '\n# gameservices-test-ca %s\n' "$fp"; cat "$GS_WORK/ca.pem"; } >> "$TLS/curl-ca-bundle.crt"
+	fi
+}
+
+# --- Module builds ------------------------------------------------------------
+cleanup() {
+	set +e
+	if [ -n "${MOCK_PID:-}" ]; then
+		kill "$MOCK_PID" 2>/dev/null
+		wait "$MOCK_PID" 2>/dev/null
+	fi
+	# GS_KEEP=1 leaves the module and servers in place to re-run single tests
+	# with GS_NOBOOT=1.
+	[ "${GS_KEEP:-0}" = 1 ] && return
+	rm -f "$THIRD_SRC/gameservices.c" "$THIRD_SRC/gameservices.so" \
+		"$UHOME/modules/third/gameservices.so" "$UHOME/conf/gameservices.v1-mode"
+	for f in server.cert.pem server.key.pem; do
+		[ -f "$TLS/$f.gs-orig" ] && mv -f "$TLS/$f.gs-orig" "$TLS/$f"
+	done
+}
+trap cleanup EXIT
+
+if [ -n "${GS_OLD_SRC:-}" ]; then
+	echo "Building the previous gameservices for the upgrade test..."
+	cp "$GS_OLD_SRC" "$THIRD_SRC/gameservices.c"
+	(cd "$UHOME/source" && $MAKE custommodule MODULEFILE=gameservices >/dev/null)
+	cp "$THIRD_SRC/gameservices.so" "$GS_WORK/gameservices-old.so"
+	rm -f "$THIRD_SRC/gameservices.so"
+	export GS_OLD_SO="$GS_WORK/gameservices-old.so"
+fi
+cp "$SRC" "$THIRD_SRC/gameservices.c"
+
+# --- Mock games API -----------------------------------------------------------
+pkill -f "irctestframework.gameservices.mock_api" 2>/dev/null || true
+PYTHONPATH="$SUITE_ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 -m irctestframework.gameservices.mock_api \
+	--cert "$GS_WORK/server.pem" --key "$GS_WORK/server.key" >"$GS_WORK/mock.log" 2>&1 &
+MOCK_PID=$!
+for _ in $(seq 1 50); do
+	if curl -fsS http://127.0.0.1:5801/__mock/health >/dev/null 2>&1; then
+		break
+	fi
+	sleep 0.2
+done
+curl -fsS http://127.0.0.1:5801/__mock/health >/dev/null
+curl -fsS --cacert "$GS_WORK/ca.pem" -o /dev/null -w '' https://localhost:5800/api/v1/internal/irc/channels -H 'Authorization: Bearer gs-test-key'
+
+# --- Tests --------------------------------------------------------------------
+if [ $# -gt 0 ]; then
+	TESTS=("$@")
+else
+	# Splits and module reloads go last; everything runs one test at a time.
+	mapfile -t TESTS < <(find tests/modules -maxdepth 1 -type f -name 'gameservices_*' \
+		! -name gameservices_multi_server_sync ! -name gameservices_upgrade_rehash | sort)
+	TESTS+=(tests/modules/gameservices_multi_server_sync tests/modules/gameservices_upgrade_rehash)
+fi
+export GS_SUITE=1
+
+export PYTHONPATH="$SUITE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+if [ "${GS_NOBOOT:-0}" = 1 ]; then
+	./run -services none "${TESTS[@]}"
+	exit $?
+fi
+
+# --- Build and boot (as ./run -boot does, with our TLS files in place) -------
+cp -a serverconfig/unrealircd/modules/*.c "$THIRD_SRC/"
+(cd "$UHOME/source" && $MAKE install >"$GS_WORK/make.log" 2>&1) || { tail -50 "$GS_WORK/make.log"; exit 1; }
+test -f "$UHOME/modules/third/gameservices.so"
+install_tls
+
+PROCS="ircd|unrealircd"
+pkill -15 -U "$UID" "$PROCS" 2>/dev/null || true
+for _ in $(seq 1 15); do
+	pgrep -U "$UID" "$PROCS" >/dev/null || break
+	sleep 1
+done
+pkill -9 -U "$UID" "$PROCS" 2>/dev/null || true
+cp -a serverconfig/unrealircd/* "$UHOME/conf/"
+rm -f "$UHOME/conf/gameservices.v1-mode"
+(
+	cd "$UHOME"
+	mkdir -p data/old
+	mv data/*.db data/old/ 2>/dev/null || true
+	rm -rf data/history.old
+	mv data/history data/history.old 2>/dev/null || true
+	export ASAN_OPTIONS=abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1
+	for name in irc2 irc1 irc3; do
+		bin/unrealircd -f "$name.conf"
+		sleep 1
+		kill -1 "$(cat data/unrealircd.pid)"
+	done
+)
+sleep 2
+export PYTHONPATH="$SUITE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p logs/success logs/failure
+timeout --kill-after=5 --signal=INT 10 tests/_pre_test || { echo "Linking servers failed" >&2; exit 1; }
+
+./run -services none "${TESTS[@]}"

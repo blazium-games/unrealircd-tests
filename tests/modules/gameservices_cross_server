@@ -1,0 +1,77 @@
+#!/usr/bin/python3
+#
+# third/gameservices across the three-server network: JOINs, roles, the +A
+# binding, the synced game list (WHOIS) and messages are the same everywhere.
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+c3b = m.new('c3b')
+m.connect()
+gs.require_module(m, c1a)
+
+owner = gs.username("owner")
+p2 = gs.username("p2")
+p3 = gs.username("p3")
+gs.login(m, c1a, owner)
+gs.login(m, c2a, p2)
+gs.login(m, c3a, p3)
+m.send(c3b, "OPER netadmin test")
+uid, chan = gs.asset(owners=[owner], licensed=[p2], guests=True)
+
+m.clearlog()
+gs.gamejoin(m, c1a, uid)
+gs.gamejoin(m, c2a, uid)
+gs.gamejoin(m, c3a, uid)
+for c in (c1a, c2a):
+    m.expect(c, "sees the irc2 player join", r":" + p2 + r"!\S+ JOIN :?" + chan, timeout=5)
+for c in (c1a, c2a, c3a):
+    m.expect(c, "sees the irc3 guest join", r":" + p3 + r"!\S+ JOIN :?" + chan, timeout=5)
+
+m.clearlog()
+for c in (c1a, c2a, c3a):
+    c.out("NAMES " + chan)
+    c.out("MODE " + chan)
+m.multisync()
+for c in (c1a, c2a, c3a):
+    m.expect(c, "owner is +o everywhere", r" 353 .*@" + owner, timeout=5)
+    m.expect(c, "irc2 player is +v everywhere", r" 353 .*\+" + p2, timeout=5)
+    m.expect(c, "+A <uid> everywhere", r" 324 \S+ " + chan + r" \+\S*A\S* .*" + uid, timeout=5)
+
+# The synced game list follows the user to every server
+m.clearlog()
+m.send(c3b, "WHOIS " + owner)
+m.expect(c3b, "oper on irc3 sees the irc1 owner's game chat", r" 1830 \S+ " + owner + " " + uid + " owner :is in game chat", timeout=5)
+m.send(c3b, "WHOIS " + p2)
+m.expect(c3b, "oper on irc3 sees the irc2 player's game chat", r" 1830 \S+ " + p2 + " " + uid + " chat :", timeout=5)
+m.send(c3a, "WHOIS " + owner)
+m.not_expect(c3a, "non-opers do not see other users' game chats", r" 1830 ")
+
+# Messages from each server
+for c, word in ((c1a, "from-irc1"), (c2a, "from-irc2")):
+    m.clearlog()
+    m.send(c, "PRIVMSG " + chan + " :" + word)
+    for other in (c1a, c2a, c3a):
+        if other is not c:
+            m.expect(other, "message " + word + " delivered", r"PRIVMSG " + chan + " :" + word, timeout=5)
+
+# A guest on irc3 is refused by irc3 itself
+m.clearlog()
+m.send(c3a, "PRIVMSG " + chan + " :guest-irc3")
+m.expect(c3a, "irc3 enforces speaking rules", r" 404 ", timeout=5)
+m.not_expect(c1a, "guest message never leaves irc3", r"guest-irc3")
+
+# Leaving clears the synced list on other servers
+m.clearlog()
+m.send(c2a, "GAMEPART " + uid)
+m.expect(c1a, "irc1 sees the PART", r":" + p2 + r"!\S+ PART " + chan, timeout=5)
+m.expect(c3a, "irc3 sees the PART", r":" + p2 + r"!\S+ PART " + chan, timeout=5)
+m.wait(1)
+m.clearlog()
+m.send(c3b, "WHOIS " + p2)
+m.expect(c3b, "WHOIS answered", r" 318 ", timeout=5)
+m.not_expect(c3b, "game list cleared network-wide", r" 1830 \S+ " + p2 + " ")

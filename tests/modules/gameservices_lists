@@ -1,0 +1,80 @@
+#!/usr/bin/python3
+#
+# third/gameservices: GAMES (needs blazium.games/commands), LFGWHO, LFGMETA,
+# LFGSTATS and LFGREFRESH (opers).
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c1b = m.new('c1b')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+m.connect()
+gs.require_module(m, c1a)
+
+owner = gs.username("owner")
+player = gs.username("player")
+gs.login(m, c1b, owner)
+gs.login(m, c2a, player)
+uid, chan = gs.asset(name="Space Race", owners=[owner], licensed=[player])
+gs.gamejoin(m, c1b, uid)
+gs.gamejoin(m, c2a, uid)
+
+m.send(c1a, "OPER netadmin test")
+
+# Refresh the list on irc1 so the new listing is known there
+m.clearlog()
+m.send(c1a, "LFGREFRESH")
+m.expect(c1a, "LFGREFRESH answers 1820", r" 1820 \S+ :Refreshing game list", timeout=5)
+m.expect(c1a, "then 1821 with the count", r" 1821 \S+ \d+ :games refreshed", timeout=10)
+
+# GAMES
+m.send(c1b, "CAP REQ :blazium.games/commands")
+m.clearlog()
+m.send(c1b, "GAMES")
+m.expect(c1b, "GAMES lists the game (1804)", r" 1804 \S+ " + uid + " " + chan + r" 2 :Space Race", timeout=5)
+m.expect(c1b, "GAMES ends with 1805", r" 1805 \S+ \d+ :End of GAMES", timeout=5)
+m.clearlog()
+m.send(c1b, "GAMES " + uid)
+m.expect(c1b, "GAMES <uid> gives one line", r" 1804 \S+ " + uid + " ", timeout=5)
+m.expect(c1b, "GAMES <uid> ends with count 1", r" 1805 \S+ 1 :End of GAMES", timeout=5)
+m.clearlog()
+m.send(c1b, "GAMES " + gs.new_uid())
+m.expect(c1b, "unknown game (1842)", r" 1842 \S+ \S+ :No such game chat", timeout=5)
+m.send(c1b, "GAMES nope")
+m.expect(c1b, "bad id (1845)", r" 1845 \S+ nope :Invalid game id", timeout=5)
+
+# LFGWHO
+m.clearlog()
+m.send(c1b, "LFGWHO " + uid)
+m.expect(c1b, "LFGWHO lists the owner", r" 1810 \S+ " + uid + " " + owner + " owner :" + owner, timeout=5)
+m.expect(c1b, "LFGWHO lists the player", r" 1810 \S+ " + uid + " " + player + " chat :" + player, timeout=5)
+m.expect(c1b, "LFGWHO ends with 1811", r" 1811 \S+ " + uid + " 2 :End of LFGWHO", timeout=5)
+m.clearlog()
+m.send(c3a, "LFGWHO " + uid)
+m.expect(c3a, "non-members cannot LFGWHO (1848)", r" 1848 \S+ " + uid + " :", timeout=5)
+m.clearlog()
+m.send(c1a, "LFGWHO " + uid)
+m.expect(c1a, "opers can LFGWHO", r" 1811 \S+ " + uid + " 2 :", timeout=5)
+
+# LFGMETA
+m.clearlog()
+m.send(c1b, "LFGMETA " + uid)
+for key, value in (("name", "Space Race"), ("channel", chan), ("users", "2"), ("chat", "2"),
+                   ("spectators", "0"), ("listed", "yes"), ("bound", "yes")):
+    m.expect(c1b, "LFGMETA " + key, r" 1812 \S+ " + uid + " " + key + " :" + value + "$", timeout=5)
+m.expect(c1b, "LFGMETA ends with 1813", r" 1813 \S+ " + uid + " :End of LFGMETA", timeout=5)
+
+# LFGSTATS / LFGREFRESH need oper
+m.clearlog()
+m.send(c3a, "LFGSTATS")
+m.expect(c3a, "LFGSTATS is oper-only", r" 481 ", timeout=5)
+m.send(c3a, "LFGREFRESH")
+m.expect(c3a, "LFGREFRESH is oper-only", r" 481 .*", timeout=5)
+m.clearlog()
+m.send(c1a, "LFGSTATS")
+for key in ("uptime", "total_auths", "failed_auths", "logged_in", "spectators", "games", "game_channels", "api_errors"):
+    m.expect(c1a, "LFGSTATS " + key, r" 1818 \S+ " + key + r" :\d+", timeout=5)
+m.expect(c1a, "LFGSTATS ends with 1819", r" 1819 \S+ :End of LFGSTATS", timeout=5)

@@ -1,0 +1,94 @@
+#!/usr/bin/python3
+#
+# third/gameservices: SASL PLAIN with chat tokens. Clients outside
+# gameservices::exempt must log in before they are registered; the account
+# name becomes the nick.
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+m.connect()
+gs.require_module(m, c1a)
+
+# Successful SASL from a non-exempt address, on another server
+user = gs.username("sasl")
+tid = gs.new_token_id()
+c2b = gs.new_client(m, 'c2b', bind=gs.NON_EXEMPT, sasl=(user, gs.token(user, tid)))
+m.connect()
+if c2b.sasl_result != "903" or c2b.nick != user:
+    raise Exception("SASL login failed: result=%s nick=%s" % (c2b.sasl_result, c2b.nick))
+print("\u2714 Test passed: SASL PLAIN succeeded and the nick is the account name")
+
+m.clearlog()
+m.send(c1a, "WHOIS " + user)
+m.expect(c1a, "account is visible network-wide", r" 330 \S+ " + user + " " + user + " ", timeout=5)
+chan = "#gs-sasl-" + m.random(6)
+m.send(c1a, "JOIN " + chan)
+m.send(c2b, "JOIN " + chan)
+m.clearlog()
+m.send(c2b, "PRIVMSG " + chan + " :hi")
+acct = m.expect_tag(c1a, "account-tag carries the Blazium account", "PRIVMSG " + chan + " :hi", "account", timeout=5)
+if acct != user:
+    raise Exception("account tag was %r, expected %r" % (acct, user))
+
+# Wrong token: 904, then the connection is refused at registration
+r = gs.RawClient("c1")
+r.send("CAP LS 302")
+r.send("CAP REQ :sasl")
+r.register()
+r.expect(r" CAP \S+ ACK :sasl", what="sasl cap acknowledged")
+r.send("AUTHENTICATE PLAIN")
+r.expect(r"^AUTHENTICATE \+", what="PLAIN accepted")
+r.send("AUTHENTICATE " + gs.base64.b64encode(b"\0nobody-x\0not-a-token").decode())
+r.expect(r" 904 ", what="bad token gives 904")
+r.send("CAP END")
+r.expect(r"^ERROR .*You must log in with SASL or GAMEAUTH", what="unauthenticated non-exempt client is disconnected")
+r.close()
+
+# authcid that does not match the token's account
+victim = gs.username("other")
+r = gs.RawClient("c2")
+r.send("CAP REQ :sasl")
+r.register()
+r.expect(r" CAP \S+ ACK :sasl", what="sasl cap acknowledged")
+r.send("AUTHENTICATE PLAIN")
+r.expect(r"^AUTHENTICATE \+", what="PLAIN accepted")
+payload = ("\0" + victim + "\0" + gs.token(gs.username("real"), gs.new_token_id())).encode()
+r.send("AUTHENTICATE " + gs.base64.b64encode(payload).decode())
+r.expect(r" 904 ", what="authcid must match the token's account")
+r.close()
+
+# Revoked token
+ruser = gs.username("revoked")
+rtid = gs.new_token_id()
+gs.revoke(ruser, rtid)
+r = gs.RawClient("c3")
+r.send("CAP REQ :sasl")
+r.register()
+r.expect(r" CAP \S+ ACK :sasl", what="sasl cap acknowledged")
+r.send("AUTHENTICATE PLAIN")
+r.expect(r"^AUTHENTICATE \+", what="PLAIN accepted")
+r.send("AUTHENTICATE " + gs.base64.b64encode(("\0" + ruser + "\0" + gs.token(ruser, rtid)).encode()).decode())
+r.expect(r" 904 ", what="revoked token gives 904")
+r.close()
+
+# Mechanisms other than PLAIN, and aborts
+r = gs.RawClient("c1")
+r.send("CAP REQ :sasl")
+r.register()
+r.expect(r" CAP \S+ ACK :sasl", what="sasl cap acknowledged")
+r.send("AUTHENTICATE EXTERNAL")
+r.expect(r" 904 ", what="only PLAIN is offered")
+r.send("AUTHENTICATE PLAIN")
+r.expect(r"^AUTHENTICATE \+", what="PLAIN accepted after a failed mechanism")
+r.send("AUTHENTICATE *")
+r.expect(r" 90[46] .*", what="abort fails the exchange")
+r.close()
+
+# No login at all from a non-exempt address
+r = gs.RawClient("c2")
+r.register()
+r.expect(r"^ERROR .*You must log in with SASL or GAMEAUTH", what="non-exempt client without a login is refused")
+r.close()

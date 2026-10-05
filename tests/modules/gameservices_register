@@ -1,0 +1,29 @@
+#!/usr/bin/python3
+#
+# third/gameservices: accounts are made on the website. REGISTER and VERIFY
+# only point there (1822), before and after registration, and never create
+# or log in an account.
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+m.connect()
+gs.require_module(m, c1a)
+
+m.clearlog()
+m.send(c1a, "REGISTER * someone@example.org hunter2")
+m.expect(c1a, "REGISTER points to the website", r" 1822 \S+ REGISTER :Create your account at https://blazium\.games .*Settings > Chat", timeout=5)
+m.expect(c1a, "REGISTER explains how to log in", r" 1822 \S+ REGISTER :Log in here with SASL PLAIN or GAMEAUTH <chat-token>", timeout=5)
+m.send(c1a, "VERIFY someone 123456")
+m.expect(c1a, "VERIFY points to the website", r" 1822 \S+ VERIFY :Accounts are verified on https://blazium\.games", timeout=5)
+m.not_expect(c1a, "no account was created or logged in", r" (900|903|1800) ")
+
+r = gs.RawClient("c2")
+r.send("CAP LS 302")
+r.send("REGISTER * a@b.c pw")
+r.expect(r" 1822 \S+ REGISTER :", what="REGISTER works before registration")
+r.send("VERIFY a 1")
+r.expect(r" 1822 \S+ VERIFY :", what="VERIFY works before registration")
+r.close()

@@ -1,0 +1,67 @@
+#!/usr/bin/python3
+#
+# third/gameservices across a network-wide rehash, which is what a deploy
+# does. Modules are reloaded with users online; logins, nick locks, game
+# channel membership, the binding and tags must all survive.
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+m.disable_message_tags_check = 1
+c1a = m.new('c1a')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+m.connect()
+gs.require_module(m, c1a)
+
+c1a.out("CAP REQ :blazium.games/tags")
+m.multisync()
+owner = gs.username("owner")
+player = gs.username("player")
+gs.login(m, c1a, owner)
+tid = gs.login(m, c2a, player)
+m.send(c3a, "OPER netadmin test")
+uid, chan = gs.asset(owners=[owner], licensed=[player])
+gs.gamejoin(m, c1a, uid)
+gs.gamejoin(m, c2a, uid)
+
+m.wait(2)
+m.clearlog()
+m.send(c3a, "REHASH -global")
+m.wait(6)
+m.multisync()
+m.clearlog()
+m.send(c3a, "LFGSTATS")
+line = gs.wait_for(m, c3a, r" 1818 \S+ uptime :\d+", timeout=5, what="module was reloaded (uptime reset)")
+if int(line.rsplit(":", 1)[1]) > 20:
+    raise Exception("gameservices uptime did not reset on rehash: " + line)
+
+m.clearlog()
+m.send_all("VERSION")
+m.expect_all("module still loaded everywhere", r" 005 .*GAMESERVICES=2", timeout=5)
+
+m.clearlog()
+m.send(c2a, "PRIVMSG " + chan + " :after-rehash")
+v = m.expect_tag(c1a, "tags still added after the rehash", r"PRIVMSG " + chan + " :after-rehash", "blazium.games/role", timeout=5)
+if v != "chat":
+    raise Exception("role tag after rehash was %r" % v)
+
+m.clearlog()
+c2a.push(("NICK " + player + "z\r\n").encode())
+m.multisync()
+m.expect(c2a, "nick lock survives the rehash", r" 432 ", timeout=5)
+
+m.clearlog()
+m.send(c1a, "WHOIS " + owner)
+m.expect(c1a, "synced game list survives the rehash", r" 1830 \S+ " + owner + " " + uid + " owner :", timeout=5)
+
+m.clearlog()
+m.send(c2a, "GAMEPART " + uid)
+m.expect(c2a, "game tracking survives the rehash", r" 1803 \S+ " + uid + " ", timeout=5)
+
+# Reconcile still runs and still knows the session's token id
+gs.revoke(player, tid)
+m.sync = 0
+m.clearlog()
+m.expect(c1a, "revocation still applies after the rehash", r":" + player + r"!\S+ QUIT :.*Chat access changed", timeout=15)

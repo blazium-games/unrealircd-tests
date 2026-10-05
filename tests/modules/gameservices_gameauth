@@ -1,0 +1,106 @@
+#!/usr/bin/python3
+#
+# third/gameservices: GAMEAUTH <chat-token>, the login for clients that
+# cannot do SASL. Works after registration (exempt clients) and before it
+# (everyone else), is rate limited, and refuses a second login.
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+m.connect()
+gs.require_module(m, c1a)
+
+# After registration
+user = gs.username("auth")
+tid = gs.login(m, c1a, user)
+m.clearlog()
+m.send(c2a, "WHOIS " + user)
+m.expect(c2a, "account visible on another server", r" 330 \S+ " + user + " " + user + " ", timeout=5)
+
+m.clearlog()
+m.send(c1a, "GAMEAUTH " + gs.token(user, tid))
+m.expect(c1a, "second GAMEAUTH is refused (1843)", r" 1843 \S+ :You are already logged in", timeout=5)
+
+# Bad input
+m.clearlog()
+m.send(c2a, "GAMEAUTH")
+m.expect(c2a, "GAMEAUTH needs a token (461)", r" 461 \S+ GAMEAUTH ", timeout=5)
+m.send(c2a, "GAMEAUTH short")
+m.expect(c2a, "malformed token is refused (1846)", r" 1846 \S+ :That chat token is not valid", timeout=5)
+m.clearlog()
+m.send(c2a, "GAMEAUTH not.a.valid-token")
+m.expect(c2a, "token the API rejects gives 1841", r" 1841 \S+ :Authentication failed", timeout=10)
+m.clearlog()
+m.send(c2a, "GAMEAUTH another.bad.token")
+m.expect(c2a, "third failure still answered (1841)", r" 1841 ", timeout=10)
+m.clearlog()
+m.send(c2a, "GAMEAUTH " + gs.token(gs.username("late"), gs.new_token_id()))
+m.expect(c2a, "fourth try inside the window is rate limited (1852)", r" 1852 \S+ :Too many login attempts", timeout=5)
+m.not_expect(c2a, "rate-limited GAMEAUTH does not log in", r" 1800 ")
+
+# Exempt clients stay connected after a failed GAMEAUTH
+m.clearlog()
+m.send(c2a, "PING :still-here")
+m.expect(c2a, "exempt client still connected", r"PONG .*still-here", timeout=5)
+
+# Before registration, from a non-exempt address
+pre = gs.username("pre")
+r = gs.RawClient("c2")
+r.send("GAMEAUTH " + gs.token(pre, gs.new_token_id()))
+r.send("CAP LS 302")
+r.send("CAP END")
+r.register()
+r.expect(r" 1800 \S+ " + pre + " ", what="pre-registration GAMEAUTH")
+r.expect(r" 001 " + pre + " ", what="registered with the account nick")
+r.send("NICK somebody-else")
+r.expect(r" 432 .*Your nickname is your Blazium username", what="nick is locked once registered")
+r.close()
+
+# Registration is held while the API answers
+held = gs.username("held")
+gs.fail("gs." + held + ".", status=-1, delay=2, count=1)
+r = gs.RawClient("c3")
+r.send("GAMEAUTH " + gs.token(held, gs.new_token_id()))
+r.register()
+r.not_expect(r" 001 ", timeout=1, what="registration waits for the API")
+r.expect(r" 1800 \S+ " + held + " ", what="slow GAMEAUTH logs in")
+r.expect(r" 001 " + held + " ", what="client registers once the API answered")
+r.close()
+
+# During CAP negotiation a failed GAMEAUTH can be retried
+slow = gs.username("slow")
+gs.fail("gs." + slow + ".", status=401, delay=1, count=1)
+r = gs.RawClient("c3")
+r.send("CAP LS 302")
+r.register()
+r.send("GAMEAUTH " + gs.token(slow, gs.new_token_id()))
+r.expect(r" 1841 ", what="failed pre-registration GAMEAUTH")
+r.send("GAMEAUTH " + gs.token(slow, gs.new_token_id()))
+r.expect(r" 1800 \S+ " + slow + " ", what="retry after a failure logs in")
+r.send("CAP END")
+r.expect(r" 001 " + slow + " ", what="client registers after the retry")
+r.close()
+
+# Failed pre-registration GAMEAUTH and no retry: refused
+bad = gs.username("bad")
+gs.revoke(bad)
+r = gs.RawClient("c1")
+r.send("GAMEAUTH " + gs.token(bad, gs.new_token_id()))
+r.expect(r" 1841 ", what="revoked account cannot GAMEAUTH")
+r.register()
+r.expect(r"^ERROR .*You must log in with SASL or GAMEAUTH", what="no login, no registration")
+r.close()
+
+# A second GAMEAUTH while the first is still being checked
+busy = gs.username("busy")
+gs.fail("gs." + busy + ".", status=401, delay=3, count=1)
+r = gs.RawClient("c1")
+r.send("GAMEAUTH " + gs.token(busy, gs.new_token_id()))
+r.send("GAMEAUTH " + gs.token(busy, gs.new_token_id()))
+r.expect(r" 1852 \S+ :A login is already in progress", what="one login at a time")
+r.expect(r" 1841 ", what="first attempt finishes")
+r.close()

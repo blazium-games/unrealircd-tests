@@ -1,0 +1,59 @@
+#!/usr/bin/python3
+#
+# third/gameservices: blazium.games/membership. Clients with this cap and
+# blazium.games/tags get a server TAGMSG with their game and role when they
+# join a game chat and whenever their role changes. The synced game list is
+# shown in WHOIS (to the user and to opers).
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+m.disable_message_tags_check = 1
+c1a = m.new('c1a')
+c1b = m.new('c1b')
+c2a = m.new('c2a')
+m.connect()
+gs.require_module(m, c1a)
+
+c1a.out("CAP REQ :blazium.games/tags blazium.games/membership")
+c1b.out("CAP REQ :blazium.games/membership")
+m.multisync()
+
+u1 = gs.username("member")
+u2 = gs.username("notags")
+watcher = gs.username("watch")
+gs.login(m, c1a, u1)
+gs.login(m, c1b, u2)
+gs.login(m, c2a, watcher)
+uid, chan = gs.asset(owners=[watcher], licensed=[u1, u2])
+gs.gamejoin(m, c2a, uid)
+
+m.clearlog()
+gs.gamejoin(m, c1a, uid)
+v = m.expect_tag(c1a, "TAGMSG after join carries the role", r"^@\S+ :irc1\.test\.net TAGMSG " + chan, "blazium.games/role", timeout=5)
+if v != "chat":
+    raise Exception("role on join TAGMSG was %r" % v)
+v = m.expect_tag(c1a, "TAGMSG after join carries the game", r"TAGMSG " + chan, "blazium.games/game", timeout=5)
+if v != uid:
+    raise Exception("game on join TAGMSG was %r" % v)
+
+m.clearlog()
+gs.gamejoin(m, c1b, uid)
+m.not_expect(c1b, "membership without tags: no TAGMSG", r"TAGMSG " + chan)
+
+m.clearlog()
+m.send(c1a, "WHOIS " + u1)
+m.expect(c1a, "WHOIS self shows the game chat", r" 1830 \S+ " + u1 + " " + uid + " chat :is in game chat", timeout=5)
+m.send(c2a, "WHOIS " + u1)
+m.not_expect(c2a, "WHOIS by another user hides game chats", r" 1830 ")
+
+# Promote u1 to owner in the API; the reconcile (5s) applies it
+gs.update_asset(uid, owners=[watcher, u1], licensed=[u2])
+m.clearlog()
+m.expect(c1a, "role change sends a TAGMSG with role owner",
+         r"^@\S*blazium\.games/role=owner\S* :irc1\.test\.net TAGMSG " + chan, timeout=15)
+m.expect(c2a, "others see +o", r"MODE " + chan + r" \+o " + u1, timeout=10)
+m.clearlog()
+m.send(c1a, "WHOIS " + u1)
+m.expect(c1a, "WHOIS reflects the new role", r" 1830 \S+ " + u1 + " " + uid + " owner :", timeout=5)

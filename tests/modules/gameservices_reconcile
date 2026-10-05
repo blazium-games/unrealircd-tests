@@ -1,0 +1,66 @@
+#!/usr/bin/python3
+#
+# third/gameservices reconcile (every 5s in the test config): the module
+# reports signed-in sessions with their token ids and rechecks every game
+# channel. Revoked tokens disconnect, bans part, suspensions devoice.
+#
+import time
+
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c1b = m.new('c1b')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+m.connect()
+gs.require_module(m, c1a)
+
+gone = gs.username("gone")
+kept = gs.username("kept")
+banned = gs.username("banned")
+owner = gs.username("owner")
+started = time.time()
+gone_tid = gs.login(m, c1a, gone)
+kept_tid = gs.login(m, c1b, kept)
+gs.login(m, c2a, banned)
+gs.login(m, c3a, owner)
+uid, chan = gs.asset(owners=[owner], licensed=[gone, kept, banned])
+for c in (c3a, c1a, c1b, c2a):
+    gs.gamejoin(m, c, uid)
+
+# The module reports sessions with their token ids
+gs.wait_until(m, lambda: any(kept_tid in r["body"] for r in gs.api_log("/internal/irc/sessions", since=started)),
+              timeout=15, what="sessions report includes the token id")
+gs.wait_until(m, lambda: any(uid in r["body"] for r in gs.api_log("/internal/irc/access", since=started)),
+              timeout=15, what="game channel access is rechecked")
+
+# Revoking one token ends exactly that session
+gs.revoke(gone, gone_tid)
+gs.revoke(kept, gs.new_token_id())
+m.sync = 0
+m.clearlog()
+m.expect(c3a, "revoked session is disconnected", r":" + gone + r"!\S+ QUIT :.*Chat access changed", timeout=15)
+del m.clients['c1a']
+c1a.close()
+m.sync = 1
+m.multisync()
+m.wait(6)
+m.not_expect(c3a, "a different token id of another account is not affected", r":" + kept + r"!\S+ QUIT")
+
+# A ban in the API parts the user at the next recheck
+gs.update_asset(uid, banned=[banned])
+m.clearlog()
+m.expect(c3a, "banned player is parted", r":" + banned + r"!\S+ PART " + chan + " :License changed", timeout=15)
+
+# Suspension devoices, lifting it voices again
+gs.update_asset(uid, suspended=[kept])
+m.clearlog()
+m.expect(c3a, "suspended player is devoiced", r"MODE " + chan + r" -v " + kept, timeout=15)
+m.clearlog()
+m.send(c1b, "PRIVMSG " + chan + " :while-suspended")
+m.expect(c1b, "suspended player cannot speak", r" 404 ", timeout=5)
+gs.update_asset(uid, suspended=[])
+m.clearlog()
+m.expect(c3a, "suspension lifted: voiced again", r"MODE " + chan + r" \+v " + kept, timeout=15)

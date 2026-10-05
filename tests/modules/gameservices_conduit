@@ -1,0 +1,102 @@
+#!/usr/bin/python3
+#
+# Conduit end to end: the real conduit binary (CONDUIT_BIN) signs in to irc1
+# over TLS with a service token from the mock API, joins every listed game,
+# and applies the commands the platform pushes down its websocket.
+#
+import os
+import subprocess
+import sys
+import time
+
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+binary = os.environ.get("CONDUIT_BIN", "")
+if not binary or not os.access(binary, os.X_OK):
+    print("SKIP: CONDUIT_BIN is not set")
+    sys.exit(0)
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+m.connect()
+gs.require_module(m, c1a)
+
+owner = gs.username("owner")
+player = gs.username("player")
+gs.login(m, c1a, owner)
+player_tid = gs.login(m, c2a, player)
+uid, chan = gs.asset(name="Conduit Game", owners=[owner], licensed=[player])
+gs.gamejoin(m, c1a, uid)
+gs.gamejoin(m, c2a, uid)
+
+env = dict(os.environ)
+env.update({
+    "GAMES_API_URL": "https://localhost:5800",
+    "GAMES_API_KEY": "gs-test-key",
+    "GAMES_IRC_ADDR": "127.0.0.1:5901",
+    "GAMES_IRC_CA_FILE": os.path.join(os.environ.get("GS_WORK", ""), "ca.pem"),
+})
+log = open(os.path.join(os.environ.get("GS_WORK", "/tmp"), "conduit.log"), "w")
+before = gs.conduit_state()["connects"]
+proc = subprocess.Popen([binary], env=env, stdout=log, stderr=subprocess.STDOUT)
+try:
+    m.clearlog()
+    m.expect(c1a, "conduit joins the listed game as +o", r":" + gs.SERVICE_NICK + r"!\S+ JOIN :?" + chan, timeout=30)
+    gs.wait_until(m, lambda: gs.conduit_state()["connects"] > before and gs.conduit_state()["connected"] >= 1,
+                  timeout=30, what="conduit websocket connected")
+    m.multisync()
+    m.clearlog()
+    m.send(c1a, "NAMES " + chan)
+    m.expect(c1a, "service nick has ops", r" 353 .*@" + gs.SERVICE_NICK, timeout=5)
+
+    # join for a new listing
+    uid2, chan2 = gs.asset(name="Second Game", owners=[owner])
+    gs.gamejoin(m, c1a, uid2)
+    m.clearlog()
+    gs.conduit_push({"op": "join", "asset_uid": uid2})
+    m.expect(c1a, "pushed join puts the service nick in the new game", r":" + gs.SERVICE_NICK + r"!\S+ JOIN :?" + chan2, timeout=10)
+
+    # say
+    m.clearlog()
+    gs.conduit_push({"op": "say", "channel": chan, "by": "mod", "text": "hello from staff\nsecond line"})
+    m.expect(c2a, "say is relayed as one line", r":" + gs.SERVICE_NICK + r"!\S+ PRIVMSG " + chan + " :mod: hello from staff second line", timeout=10)
+
+    # suspend / unsuspend / ban
+    m.clearlog()
+    gs.conduit_push({"op": "suspend", "channel": chan, "username": player})
+    m.expect(c1a, "suspend devoices", r"MODE " + chan + r" -v " + player, timeout=10)
+    m.clearlog()
+    gs.conduit_push({"op": "unsuspend", "channel": chan, "username": player})
+    m.expect(c1a, "unsuspend voices", r"MODE " + chan + r" \+v " + player, timeout=10)
+    m.clearlog()
+    gs.conduit_push({"op": "ban", "channel": chan, "username": player})
+    m.expect(c1a, "ban parts the player", r":" + player + r"!\S+ PART " + chan + " :Removed from game chat", timeout=10)
+
+    # kill aimed at the service nick is ignored; kill with the token id works
+    m.clearlog()
+    gs.conduit_push({"op": "kill", "username": gs.SERVICE_NICK, "token_id": "*"})
+    m.wait(2)
+    m.not_expect(c1a, "service nick cannot be killed", r":" + gs.SERVICE_NICK + r"!\S+ QUIT")
+    m.sync = 0
+    m.clearlog()
+    gs.conduit_push({"op": "kill", "username": player, "token_id": player_tid, "text": "Token regenerated"})
+    m.expect(c1a, "kill ends the player's session", r":" + player + r"!\S+ QUIT :.*Token regenerated", timeout=10)
+    del m.clients['c2a']
+    c2a.close()
+    m.sync = 1
+
+    gs.wait_until(m, lambda: any('"heartbeat"' in x for x in gs.conduit_state()["received"]),
+                  timeout=10, what="conduit sends heartbeats")
+finally:
+    proc.terminate()
+    try:
+        proc.wait(10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    log.close()
+
+m.clearlog()
+m.expect(c1a, "service nick leaves when conduit stops", r":" + gs.SERVICE_NICK + r"!\S+ QUIT", timeout=10)

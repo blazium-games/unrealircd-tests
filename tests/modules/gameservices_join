@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+#
+# third/gameservices: GAMEJOIN / GAMEPART. The API decides; owners are +o,
+# licensed players +v, guests join unvoiced, everyone else is refused. The
+# channel gets +ntm and the +A <uid> / +P binding.
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c1b = m.new('c1b')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+m.connect()
+gs.require_module(m, c1a)
+
+owner = gs.username("owner")
+player = gs.username("player")
+guest = gs.username("guest")
+stranger = gs.username("stranger")
+gs.login(m, c1a, owner)
+gs.login(m, c2a, player)
+gs.login(m, c3a, guest)
+gs.login(m, c1b, stranger)
+
+uid, chan = gs.asset(name="Join Test", owners=[owner], licensed=[player], guests=True)
+closed_uid, closed_chan = gs.asset(name="No Guests", owners=[owner], guests=False)
+
+# Owner creates the channel
+m.clearlog()
+gs.gamejoin(m, c1a, uid)
+m.expect(c1a, "owner gets 1801 with role owner", r" 1801 \S+ " + chan + " " + uid + r" owner :Joined game chat")
+m.expect(c1a, "owner JOIN", r":" + owner + r"!\S+ JOIN :?" + chan)
+m.expect(c1a, "new game channel is +ntm", r"MODE " + chan + r" \+mnt", timeout=5)
+m.expect(c1a, "channel is bound with +A <uid>", r"MODE " + chan + r" \+(AP|PA) " + uid, timeout=5)
+
+# Licensed player on another server
+m.clearlog()
+gs.gamejoin(m, c2a, uid)
+m.expect(c2a, "licensed player gets role chat", r" 1801 \S+ " + chan + " " + uid + r" chat :")
+m.expect(c1a, "owner sees the player join", r":" + player + r"!\S+ JOIN :?" + chan, timeout=5)
+
+# Guest (listing allows guests)
+m.clearlog()
+gs.gamejoin(m, c3a, uid)
+m.expect(c3a, "guest gets role spectator", r" 1801 \S+ " + chan + " " + uid + r" spectator :")
+
+m.clearlog()
+m.send(c1b, "NAMES " + chan)
+m.send(c2a, "NAMES " + chan)
+m.expect(c2a, "owner is +o", r" 353 .*@" + owner, timeout=5)
+m.expect(c2a, "player is +v", r" 353 .*\+" + player, timeout=5)
+m.expect(c2a, "guest has no prefix", r" 353 .*[ :]" + guest + r"( |$)", timeout=5)
+
+m.clearlog()
+m.send(c1a, "MODE " + chan)
+m.expect(c1a, "324 shows +A with the uid", r" 324 \S+ " + chan + r" \+\S*A\S* .*" + uid, timeout=5)
+
+# Who may speak
+m.clearlog()
+m.send(c2a, "PRIVMSG " + chan + " :licensed hello")
+m.expect(c1a, "licensed player can speak", r"PRIVMSG " + chan + " :licensed hello", timeout=5)
+m.send(c3a, "PRIVMSG " + chan + " :guest hello")
+m.expect(c3a, "guest cannot speak", r" 404 .*You need a license to speak in this game chat", timeout=5)
+m.not_expect(c1a, "guest message not delivered", r"guest hello")
+
+# Refused joins
+m.clearlog()
+m.send(c1b, "GAMEJOIN " + closed_uid)
+m.expect(c1b, "no license and no guests: refused", r"NOTICE .*You cannot join that game chat", timeout=10)
+m.clearlog()
+m.send(c1b, "GAMEJOIN " + gs.new_uid())
+m.expect(c1b, "unknown game: refused", r"NOTICE .*You cannot join that game chat", timeout=10)
+m.clearlog()
+m.send(c1b, "GAMEJOIN not-a-uid")
+m.expect(c1b, "bad game id", r"NOTICE .*That game id is not valid", timeout=5)
+m.send(c1b, "JOIN " + chan)
+m.expect(c1b, "plain JOIN refused", r" 473 .*" + chan, timeout=5)
+
+# Joining again re-applies the role without a second JOIN
+m.clearlog()
+m.send(c2a, "GAMEJOIN " + uid)
+m.expect(c2a, "repeat GAMEJOIN answers 1801", r" 1801 \S+ " + chan + " " + uid + " chat", timeout=10)
+m.not_expect(c1a, "no second JOIN", r":" + player + r"!\S+ JOIN")
+
+# GAMEPART
+m.clearlog()
+m.send(c3a, "GAMEPART " + uid)
+m.expect(c3a, "GAMEPART answers 1803", r" 1803 \S+ " + uid + " :Left game chat", timeout=5)
+m.expect(c1a, "others see the PART", r":" + guest + r"!\S+ PART " + chan, timeout=5)
+
+# The binding survives an empty channel (+P)
+m.send(c1a, "GAMEPART " + uid)
+m.send(c2a, "GAMEPART " + uid)
+m.clearlog()
+gs.gamejoin(m, c2a, uid)
+m.send(c2a, "MODE " + chan)
+m.expect(c2a, "+A is still set after everyone left", r" 324 \S+ " + chan + r" \+\S*A\S* .*" + uid, timeout=5)
