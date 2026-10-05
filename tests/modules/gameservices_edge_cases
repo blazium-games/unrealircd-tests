@@ -1,0 +1,87 @@
+#!/usr/bin/python3
+#
+# third/gameservices edge cases: missing parameters, privileged commands,
+# odd listing names, and the service account's GAMEAPPLY / GAMEKILL, which
+# are routed to the target's own server.
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c1b = m.new('c1b')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+m.connect()
+gs.require_module(m, c1a)
+
+m.clearlog()
+for cmd in ("GAMEJOIN", "GAMEPART", "LFGSUB", "LFGUNSUB", "LFGWHO", "LFGMETA"):
+    m.send(c1a, cmd)
+    m.expect(c1a, cmd + " without parameters gives 461", r" 461 \S+ " + cmd + " ", timeout=5)
+
+m.clearlog()
+m.send(c1a, "GAMEPART " + gs.new_uid())
+m.not_expect(c1a, "GAMEPART of a game you are not in is silent", r" 1803 ")
+m.send(c1a, "GAMEKILL someone * :bye")
+m.expect(c1a, "GAMEKILL is for the service account only", r" 481 ", timeout=5)
+m.clearlog()
+m.send(c1a, "GAMEAPPLY #g0123456789abcdef someone part")
+m.expect(c1a, "GAMEAPPLY is for the service account only", r" 481 ", timeout=5)
+m.clearlog()
+m.send(c1a, "GAMEAUTH " + "a" * 9)
+m.expect(c1a, "nine-character token rejected", r" 1846 ", timeout=5)
+
+# Listing names with control characters are cleaned
+m.send(c1a, "OPER netadmin test")
+c1a.out("CAP REQ :blazium.games/commands")
+odd_uid, odd_chan = gs.asset(name="Bad\x01Name\x07Here")
+m.clearlog()
+m.send(c1a, "LFGREFRESH")
+m.expect(c1a, "refreshed", r" 1821 ", timeout=10)
+m.send(c1a, "GAMES " + odd_uid)
+m.expect(c1a, "control characters replaced in game names", r" 1804 \S+ " + odd_uid + r" \S+ \d+ :Bad Name Here$", timeout=5)
+m.send(c1a, "LFGMETA " + odd_uid)
+m.expect(c1a, "listed but no channel yet", r" 1812 \S+ " + odd_uid + " bound :no", timeout=5)
+
+# The service account: always +o, can apply roles and end sessions anywhere
+svc = gs.SERVICE_NICK
+p2 = gs.username("p2")
+p3 = gs.username("p3")
+gs.login(m, c1b, svc)
+gs.login(m, c2a, p2)
+p3_tid = gs.login(m, c3a, p3)
+uid, chan = gs.asset(licensed=[p2, p3])
+gs.gamejoin(m, c1b, uid)
+m.expect(c1b, "service account is +o in every game chat", r" 1801 \S+ " + chan + " " + uid + " owner ", timeout=5)
+gs.gamejoin(m, c2a, uid)
+gs.gamejoin(m, c3a, uid)
+
+m.clearlog()
+m.send(c1b, "GAMEAPPLY " + chan + " " + p2 + " devoice")
+m.expect(c3a, "remote devoice applied by the target's server", r"MODE " + chan + r" -v " + p2, timeout=5)
+# No clearlog: a reconcile still in flight may re-voice before GAMEAPPLY
+# voice does, which then has nothing to change.
+m.send(c1b, "GAMEAPPLY " + chan + " " + p2 + " voice")
+m.expect(c3a, "remote voice applied", r"MODE " + chan + r" \+v " + p2, timeout=5)
+m.clearlog()
+m.send(c1b, "GAMEAPPLY " + chan + " " + p2 + " explode")
+m.expect(c1b, "unknown GAMEAPPLY action", r"NOTICE .*GAMEAPPLY action must be part, devoice, or voice", timeout=5)
+m.send(c1b, "GAMEAPPLY " + chan + " nobody-here part")
+m.expect(c1b, "GAMEAPPLY for a missing user", r"NOTICE .*That player is not in the game chat", timeout=5)
+m.clearlog()
+m.send(c1b, "GAMEAPPLY " + chan + " " + p2 + " part")
+m.expect(c3a, "remote part applied", r":" + p2 + r"!\S+ PART " + chan + " :Removed from game chat", timeout=5)
+
+# GAMEKILL: wrong token id does nothing, the right one disconnects
+m.clearlog()
+m.send(c1b, "GAMEKILL " + p3 + " " + gs.new_token_id() + " :wrong token")
+m.wait(1)
+m.not_expect(c1b, "wrong token id is ignored", r":" + p3 + r"!\S+ QUIT")
+m.send(c1b, "GAMEKILL " + svc + " * :self")
+m.wait(1)
+m.not_expect(c2a, "the service account cannot be killed", r":" + svc + r"!\S+ QUIT")
+m.sync = 0
+m.clearlog()
+c1b.out("GAMEKILL " + p3 + " " + p3_tid + " :Chat access changed")
+m.expect(c1b, "GAMEKILL routed to irc3 disconnects the session", r":" + p3 + r"!\S+ QUIT :.*Chat access changed", timeout=10)

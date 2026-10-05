@@ -1,0 +1,151 @@
+#!/usr/bin/python3
+#
+# Upgrading third/gameservices in place, the way a deploy does it: the
+# previous build (GS_OLD_SO, built by run-suite from GS_OLD_SRC) is running
+# with users signed in and in game chats, the new .so is installed and the
+# network rehashes. Nobody may be disconnected, and logins, game tracking,
+# token ids and the nick lock must carry over. Channels made by the old
+# build get their +A binding at the next reconcile. A rollback to the old
+# build and forward again, with users in a game chat, must not crash or
+# lose that state either.
+#
+import os
+import shutil
+import sys
+
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+old_so = os.environ.get("GS_OLD_SO", "")
+if not old_so or not os.path.isfile(old_so):
+    print("SKIP: GS_OLD_SO is not set")
+    sys.exit(0)
+
+home = os.environ.get("UNREALIRCD_HOME", os.path.expanduser("~/unrealircd"))
+installed = os.path.join(home, "modules", "third", "gameservices.so")
+v1_mode = os.path.join(home, "conf", "gameservices.v1-mode")
+new_so = os.path.join(os.environ.get("GS_WORK", "/tmp"), "gameservices-new.so")
+
+m = irctestframework.irctest.IrcTest()
+m.disable_message_tags_check = 1
+c1a = m.new('c1a')
+c3a = m.new('c3a')
+m.connect()
+gs.require_module(m, c1a)
+m.send(c1a, "OPER netadmin test")
+
+shutil.copyfile(installed, new_so)
+
+
+def install(path):
+    tmp = installed + ".tmp"
+    shutil.copyfile(path, tmp)
+    os.chmod(tmp, 0o700)
+    os.replace(tmp, installed)
+
+
+def rehash_all():
+    m.clearlog()
+    c1a.out("REHASH -global")
+    m.wait(6)
+    m.multisync()
+
+
+try:
+    # Downgrade the network to the previous build
+    open(v1_mode, "w").close()
+    install(old_so)
+    rehash_all()
+    m.clearlog()
+    m.send(c1a, "VERSION")
+    m.wait(1)
+    # 1.0.x advertised no GAMESERVICES token, and creating a game chat crashed
+    # it (set_channel_mode with NULL parameters), so it only gets logins.
+    legacy = not any("GAMESERVICES=" in line for line in c1a.all_lines)
+
+    # Users sign in with SASL on the old build and join a game chat
+    owner = gs.username("owner")
+    player = gs.username("player")
+    owner_tid = gs.new_token_id()
+    player_tid = gs.new_token_id()
+    uid, chan = gs.asset(owners=[owner], licensed=[player])
+    c1b = gs.new_client(m, 'c1b', bind=gs.NON_EXEMPT, sasl=(owner, gs.token(owner, owner_tid)))
+    c2b = gs.new_client(m, 'c2b', bind=gs.NON_EXEMPT, sasl=(player, gs.token(player, player_tid)))
+    m.connect()
+    if c1b.nick != owner or c2b.nick != player:
+        raise Exception("old build SASL login failed")
+    print("\u2714 Test passed: SASL logins on the previous build")
+
+    def join_both(when):
+        for c in (c1b, c2b):
+            c.out("GAMEJOIN " + uid)
+        m.expect(c1b, "owner joined " + when, r":" + owner + r"!\S+ JOIN :?" + chan, timeout=10)
+        m.expect(c2b, "player joined " + when, r":" + player + r"!\S+ JOIN :?" + chan, timeout=10)
+        m.multisync()
+
+    if legacy:
+        print("previous build is 1.0.x: game chats are joined after the upgrade")
+    else:
+        join_both("on the old build")
+
+    # Upgrade with everyone online
+    install(new_so)
+    os.unlink(v1_mode)
+    rehash_all()
+    m.clearlog()
+    m.send_all("VERSION")
+    m.expect_all("new build is running everywhere", r" 005 .*GAMESERVICES=2", timeout=5)
+    for c in (c1b, c2b):
+        m.send(c, "PING :survived")
+        m.expect(c, "still connected after the upgrade", r"PONG .*survived", timeout=5)
+
+    m.clearlog()
+    c2b.push(("NICK " + player + "q\r\n").encode())
+    m.multisync()
+    m.expect(c2b, "nick lock carried over", r" 432 ", timeout=5)
+    m.clearlog()
+    m.send(c1b, "GAMEAUTH " + gs.token(owner, owner_tid))
+    m.expect(c1b, "login state carried over (1843)", r" 1843 ", timeout=5)
+
+    m.clearlog()
+    if legacy:
+        join_both("after the upgrade")
+    else:
+        m.expect(c1b, "old channel is bound at the next reconcile", r"MODE " + chan + r" \+(AP|PA) " + uid, timeout=15)
+    m.send(c1b, "WHOIS " + owner)
+    m.expect(c1b, "synced game list rebuilt", r" 1830 \S+ " + owner + " " + uid + " owner :", timeout=10)
+
+    # A deploy rollback: back to the previous build and forward again while
+    # users sit in a game chat
+    open(v1_mode, "w").close()
+    install(old_so)
+    rehash_all()
+    for c in (c1b, c2b):
+        m.send(c, "PING :rolledback")
+        m.expect(c, "still connected after the rollback", r"PONG .*rolledback", timeout=5)
+    install(new_so)
+    os.unlink(v1_mode)
+    rehash_all()
+    m.clearlog()
+    m.send_all("VERSION")
+    m.expect_all("new build is back everywhere", r" 005 .*GAMESERVICES=2", timeout=5)
+    m.clearlog()
+    m.send(c1b, "GAMEAUTH " + gs.token(owner, owner_tid))
+    m.expect(c1b, "login state survived the rollback (1843)", r" 1843 ", timeout=5)
+
+    m.clearlog()
+    m.send(c1b, "GAMEPART " + uid)
+    m.expect(c1b, "game tracking carried over", r" 1803 \S+ " + uid + " ", timeout=5)
+
+    gs.revoke(player, player_tid)
+    m.sync = 0
+    m.clearlog()
+    m.expect(c1b, "token id carried over: revocation still applies", r":" + player + r"!\S+ QUIT :.*Chat access changed", timeout=15)
+    del m.clients['c2b']
+    c2b.close()
+    m.sync = 1
+finally:
+    if os.path.exists(v1_mode):
+        os.unlink(v1_mode)
+    if os.path.isfile(new_so):
+        install(new_so)

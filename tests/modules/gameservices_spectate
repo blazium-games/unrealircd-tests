@@ -1,0 +1,66 @@
+#!/usr/bin/python3
+#
+# third/gameservices: LFGSUB / LFGUNSUB. Spectators join without voice even
+# when licensed, the reconcile keeps them unvoiced, and the number of
+# spectated games is capped (max-spectating 2 in the test config).
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c2a = m.new('c2a')
+m.connect()
+gs.require_module(m, c1a)
+
+fan = gs.username("fan")
+owner = gs.username("owner")
+gs.login(m, c1a, fan)
+gs.login(m, c2a, owner)
+games = [gs.asset(name="Spectate %d" % i, owners=[owner], licensed=[fan]) for i in range(3)]
+(uid1, chan1), (uid2, chan2), (uid3, chan3) = games
+
+gs.gamejoin(m, c2a, uid1)
+
+m.clearlog()
+gs.gamejoin(m, c1a, uid1, numeric="1802", spectate=True)
+m.expect(c1a, "LFGSUB answers 1802", r" 1802 \S+ " + chan1 + " " + uid1 + " :Spectating game chat")
+m.expect(c2a, "owner sees the spectator join", r":" + fan + r"!\S+ JOIN :?" + chan1, timeout=5)
+m.not_expect(c2a, "spectator is not voiced", r"MODE " + chan1 + r" \+v " + fan)
+
+m.clearlog()
+m.send(c1a, "PRIVMSG " + chan1 + " :from the stands")
+m.expect(c1a, "spectator cannot speak", r" 404 .*" + chan1, timeout=5)
+
+m.clearlog()
+m.send(c1a, "LFGSUB " + uid1)
+m.expect(c1a, "already spectating (1843)", r" 1843 \S+ " + uid1 + " :Already in that game chat", timeout=5)
+
+gs.gamejoin(m, c1a, uid2, numeric="1802", spectate=True)
+m.clearlog()
+m.send(c1a, "LFGSUB " + uid3)
+m.expect(c1a, "spectate limit (1844)", r" 1844 \S+ 2 :Too many spectated games", timeout=5)
+
+m.clearlog()
+m.send(c1a, "LFGSUB not-a-uid")
+m.expect(c1a, "bad game id (1845)", r" 1845 \S+ not-a-uid :Invalid game id", timeout=5)
+
+# The reconcile (5s) must not voice a licensed spectator
+m.clearlog()
+m.wait(7)
+m.not_expect(c2a, "reconcile keeps the spectator unvoiced", r"MODE " + chan1 + r" \+v " + fan)
+
+m.clearlog()
+m.send(c1a, "LFGUNSUB " + uid1)
+m.expect(c1a, "LFGUNSUB answers 1803", r" 1803 \S+ " + uid1 + " :Left game chat", timeout=5)
+m.expect(c2a, "owner sees the spectator leave", r":" + fan + r"!\S+ PART " + chan1, timeout=5)
+m.clearlog()
+m.send(c1a, "LFGUNSUB " + uid1)
+m.expect(c1a, "not spectating (1848)", r" 1848 \S+ " + uid1 + " :You are not in that game chat", timeout=5)
+
+# A full GAMEJOIN does not count against the spectate limit and voices
+m.clearlog()
+gs.gamejoin(m, c1a, uid3)
+m.expect(c1a, "GAMEJOIN after spectating gives role chat", r" 1801 \S+ " + chan3 + " " + uid3 + " chat")
+m.send(c1a, "LFGSUB " + uid1)
+m.expect(c1a, "slot freed by LFGUNSUB can be reused", r" 1802 \S+ " + chan1 + " " + uid1, timeout=10)

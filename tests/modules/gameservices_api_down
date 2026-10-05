@@ -1,0 +1,92 @@
+#!/usr/bin/python3
+#
+# third/gameservices when the games API fails: logins fail closed, joins say
+# chat is unavailable (1847), the game list falls back to the last good copy,
+# and a failing sessions call never disconnects anyone.
+#
+import time
+
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c1b = m.new('c1b')
+c1c = m.new('c1c')
+m.connect()
+gs.require_module(m, c1a)
+m.send(c1a, "OPER netadmin test")
+c1a.out("CAP REQ :blazium.games/commands")
+m.multisync()
+
+# Login while verify is down
+user = gs.username("down")
+gs.fail("gs." + user + ".", status=503)
+m.clearlog()
+m.send(c1b, "GAMEAUTH " + gs.token(user, gs.new_token_id()))
+m.expect(c1b, "verify outage: GAMEAUTH fails (1841)", r" 1841 ", timeout=10)
+gs.unfail("gs." + user + ".")
+gs.fail("gs." + user + ".", status=0, count=1)
+m.clearlog()
+m.send(c1b, "GAMEAUTH " + gs.token(user, gs.new_token_id()))
+m.expect(c1b, "connection reset: GAMEAUTH fails (1841)", r" 1841 ", timeout=10)
+tid = gs.login(m, c1b, user)
+
+# Join while join is down
+uid, chan = gs.asset(name="Outage Game", licensed=[user])
+gs.fail(uid, status=503)
+m.clearlog()
+m.send(c1b, "GAMEJOIN " + uid)
+m.expect(c1b, "join outage: notice", r"NOTICE .*Game chat is unavailable right now", timeout=10)
+m.expect(c1b, "join outage: 1847", r" 1847 \S+ " + uid + " :Game chat is unavailable right now", timeout=5)
+gs.unfail(uid)
+gs.fail(uid, status=200, count=1)
+m.clearlog()
+m.send(c1b, "GAMEJOIN " + uid)
+m.expect(c1b, "malformed API answer refuses the join", r"NOTICE .*You cannot join that game chat", timeout=10)
+gs.gamejoin(m, c1b, uid)
+
+# Game list: good refresh, then an outage keeps the old list
+m.clearlog()
+m.send(c1a, "LFGREFRESH")
+m.expect(c1a, "list refreshed", r" 1821 ", timeout=10)
+gs.fail("/internal/irc/games", status=503)
+m.clearlog()
+m.send(c1a, "LFGREFRESH")
+m.expect(c1a, "games outage: 1847", r" 1847 \S+ :Game list is unavailable right now", timeout=10)
+m.send(c1a, "GAMES " + uid)
+m.expect(c1a, "last good list still served", r" 1804 \S+ " + uid + " " + chan + " 1 :Outage Game", timeout=5)
+gs.unfail("/internal/irc/games")
+
+# Sessions outage does not disconnect, and the revoke lands once it is back
+gs.fail("/internal/irc/sessions", status=500)
+gs.revoke(user, tid)
+m.clearlog()
+m.wait(7)
+m.send(c1b, "PING :alive-during-outage")
+m.expect(c1b, "sessions outage disconnects nobody", r"PONG .*alive-during-outage", timeout=5)
+gs.unfail("/internal/irc/sessions")
+m.sync = 0
+m.clearlog()
+m.expect(c1a, "revocation applied after the API recovers", r":" + user + r"!\S+ QUIT :.*Chat access changed", timeout=15)
+del m.clients['c1b']
+c1b.close()
+m.sync = 1
+
+# Access recheck outage keeps people in the channel
+other = gs.username("stay")
+gs.login(m, c1c, other)
+uid2, chan2 = gs.asset(licensed=[other])
+gs.gamejoin(m, c1c, uid2)
+gs.fail("/internal/irc/access", status=503)
+m.clearlog()
+m.wait(7)
+m.send(c1c, "PRIVMSG " + chan2 + " :still-here")
+m.not_expect(c1c, "access outage does not part or devoice", r" 404 | PART ")
+gs.unfail("/internal/irc/access")
+
+m.clearlog()
+m.send(c1a, "LFGSTATS")
+line = gs.wait_for(m, c1a, r" 1818 \S+ api_errors :\d+", timeout=5, what="api_errors counted")
+if int(line.rsplit(":", 1)[1]) < 1:
+    raise Exception("api_errors did not increase: " + line)

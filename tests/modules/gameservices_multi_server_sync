@@ -1,0 +1,81 @@
+#!/usr/bin/python3
+#
+# third/gameservices through a netsplit and relink: irc3 leaves the network
+# while users sit in a game chat, then links again. The +A binding, roles,
+# the synced game list and the game tags must come back on both sides.
+# Run after the other suites (irctestframework/gameservices/run-suite does).
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+m.disable_message_tags_check = 1
+c1a = m.new('c1a')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+c3b = m.new('c3b')
+m.connect()
+gs.require_module(m, c1a)
+
+for c in (c1a, c3a):
+    c.out("CAP REQ :blazium.games/tags")
+m.multisync()
+
+owner = gs.username("owner")
+p3 = gs.username("p3")
+gs.login(m, c1a, owner)
+gs.login(m, c3a, p3)
+m.send(c3b, "OPER netadmin test")
+m.send(c2a, "OPER netadmin test")
+uid, chan = gs.asset(owners=[owner], licensed=[p3])
+gs.gamejoin(m, c1a, uid)
+gs.gamejoin(m, c3a, uid)
+
+# Split irc3 off
+m.sync = 0
+m.clearlog()
+c3b.out("SQUIT irc2.test.net :gameservices split test")
+m.expect(c1a, "irc1 sees the irc3 player quit in the split", r":" + p3 + r"!\S+ QUIT :irc2\.test\.net irc3\.test\.net", timeout=15)
+
+# Both halves keep the binding and roles
+m.clearlog()
+c3a.out("MODE " + chan)
+c1a.out("MODE " + chan)
+m.expect(c3a, "irc3 keeps +A during the split", r" 324 \S+ " + chan + r" \+\S*A\S* .*" + uid, timeout=5)
+m.expect(c1a, "irc1 keeps +A during the split", r" 324 \S+ " + chan + r" \+\S*A\S* .*" + uid, timeout=5)
+c3a.out("PRIVMSG " + chan + " :inside-split")
+m.wait(1)
+m.not_expect(c1a, "split side messages stay on irc3", r"inside-split")
+
+# Relink
+m.clearlog()
+c3b.out("CONNECT irc2.test.net")
+m.expect(c3b, "irc3 relinks to irc2", r"irc2\.test\.net.*is now synced|is now synced.*irc2\.test\.net", timeout=30)
+m.expect(c1a, "irc1 sees the irc3 player come back", r":" + p3 + r"!\S+ JOIN :?" + chan, timeout=20)
+m.wait(2)
+m.sync = 1
+m.multisync()
+
+m.clearlog()
+for c in (c1a, c3a):
+    c.out("NAMES " + chan)
+    c.out("MODE " + chan)
+m.multisync()
+for c in (c1a, c3a):
+    m.expect(c, "+A survives the relink", r" 324 \S+ " + chan + r" \+\S*A\S* .*" + uid, timeout=5)
+    m.expect(c, "owner still +o", r" 353 .*@" + owner, timeout=5)
+    m.expect(c, "player still +v", r" 353 .*\+" + p3, timeout=5)
+
+# Synced game list is burst again on the link
+m.clearlog()
+m.send(c2a, "WHOIS " + p3)
+m.expect(c2a, "irc2 oper sees the irc3 player's game chat after relink", r" 1830 \S+ " + p3 + " " + uid + " chat :", timeout=5)
+m.send(c3b, "WHOIS " + owner)
+m.expect(c3b, "irc3 oper sees the irc1 owner's game chat after relink", r" 1830 \S+ " + owner + " " + uid + " owner :", timeout=5)
+
+# Tags flow again
+m.clearlog()
+m.send(c3a, "PRIVMSG " + chan + " :after-relink")
+v = m.expect_tag(c1a, "game tag relayed after the relink", r"PRIVMSG " + chan + " :after-relink", "blazium.games/game", timeout=5)
+if v != uid:
+    raise Exception("game tag was %r" % v)

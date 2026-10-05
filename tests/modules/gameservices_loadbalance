@@ -1,0 +1,41 @@
+#!/usr/bin/python3
+#
+# third/gameservices load balancing: with
+# load-balancing::max-local-users-per-channel 3 a fourth local member of a
+# game chat is refused (1851) and pointed at another server (1860).
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c1b = m.new('c1b')
+c1c = m.new('c1c')
+c1d = m.new('c1d')
+c2a = m.new('c2a')
+m.connect()
+gs.require_module(m, c1a)
+
+users = {}
+for name, c in (("a", c1a), ("b", c1b), ("c", c1c), ("d", c1d), ("e", c2a)):
+    users[name] = gs.username("lb" + name)
+    gs.login(m, c, users[name])
+uid, chan = gs.asset(licensed=list(users.values()))
+
+for c in (c1a, c1b, c1c):
+    gs.gamejoin(m, c, uid)
+
+m.clearlog()
+m.send(c1d, "GAMEJOIN " + uid)
+m.expect(c1d, "fourth local member refused (1851)", r" 1851 \S+ " + chan + " :Game chat is full on this server", timeout=10)
+m.expect(c1d, "pointed at another server (1860)", r" 1860 \S+ " + chan + r" irc[23]\.test\.net :Try connecting to this server", timeout=5)
+m.not_expect(c1a, "no JOIN for the refused user", r":" + users["d"] + r"!\S+ JOIN")
+
+m.clearlog()
+gs.gamejoin(m, c2a, uid)
+m.expect(c1a, "a member on another server can still join", r":" + users["e"] + r"!\S+ JOIN :?" + chan, timeout=5)
+
+m.clearlog()
+m.send(c1a, "GAMEPART " + uid)
+gs.gamejoin(m, c1d, uid)
+m.expect(c1d, "a freed slot can be taken", r" 1801 \S+ " + chan + " ", timeout=5)

@@ -1,0 +1,59 @@
+#!/usr/bin/python3
+#
+# third/gameservices: the module is loaded on every server, advertises its
+# ISUPPORT tokens, caps and SASL mechanism, and owns channel mode +A and the
+# #g<hex> channel namespace.
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+m.connect()
+gs.require_module(m, c1a)
+
+m.clearlog()
+m.send_all("VERSION")
+m.expect_all("GAMESERVICES=2 in ISUPPORT on every server", r" 005 .*GAMESERVICES=2", timeout=5)
+m.expect_all("GAMEVENDOR=blazium.games in ISUPPORT", r" 005 .*GAMEVENDOR=blazium\.games", timeout=5)
+
+m.clearlog()
+m.send_all("CAP LS 302")
+m.expect_all("blazium.games/tags cap", r" CAP \S+ LS .*blazium\.games/tags", timeout=5)
+m.expect_all("blazium.games/commands cap", r" CAP \S+ LS .*blazium\.games/commands", timeout=5)
+m.expect_all("blazium.games/membership cap", r" CAP \S+ LS .*blazium\.games/membership", timeout=5)
+m.expect_all("SASL PLAIN offered", r" CAP \S+ LS .*sasl=PLAIN", timeout=5)
+
+m.clearlog()
+m.send(c1a, "MODULE")
+m.expect(c1a, "third/gameservices listed by MODULE", r" 304 .*third/gameservices - .*GAMEAUTH", timeout=5)
+
+# GAMES needs blazium.games/commands
+m.clearlog()
+m.send(c1a, "GAMES")
+m.expect(c1a, "GAMES without the commands cap is refused (1850)", r" 1850 \S+ GAMES blazium\.games/commands :", timeout=5)
+
+# Game channels cannot be joined with JOIN
+uid, chan = gs.asset()
+m.clearlog()
+m.send(c2a, "JOIN " + chan)
+m.expect(c2a, "JOIN of a #g channel is refused", r" 473 .*" + chan + ".*GAMEJOIN", timeout=5)
+
+# +A is set by game services only, not by users or opers
+plain = m.randchan()
+m.send(c1a, "JOIN " + plain)
+m.clearlog()
+m.send(c1a, "MODE " + plain + " +A " + uid)
+m.expect(c1a, "users cannot set +A", r" 974 .*A.*game services", timeout=5)
+m.send(c1a, "OPER netadmin test")
+m.clearlog()
+m.send(c1a, "MODE " + plain + " +A " + uid)
+m.expect(c1a, "opers cannot set +A either", r" 974 .*A.*game services", timeout=5)
+m.not_expect(c1a, "no MODE +A broadcast", r"MODE " + plain + r" \+A")
+
+# Unauthenticated GAMEJOIN
+m.clearlog()
+m.send(c3a, "GAMEJOIN " + uid)
+m.expect(c3a, "GAMEJOIN needs a login", r"NOTICE .*Authenticate before joining game chat", timeout=5)

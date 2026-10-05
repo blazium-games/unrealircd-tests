@@ -1,0 +1,56 @@
+#!/usr/bin/python3
+#
+# Deploy notices: before maintenance the deploy opers up on a leaf and sends
+# a network-wide NOTICE to $*.<domain>. Every user on every server, signed in
+# or not, in game chats or not, must get it. When GS_ANNOUNCE points at
+# games_irc's scripts/irc_announce.py the real script is used (password on
+# stdin, never in argv).
+#
+import os
+import subprocess
+import sys
+
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c2a = m.new('c2a')
+c3a = m.new('c3a')
+c3b = m.new('c3b')
+m.connect()
+gs.require_module(m, c1a)
+
+user = gs.username("notice")
+gs.login(m, c2a, user)
+uid, chan = gs.asset(licensed=[user])
+gs.gamejoin(m, c2a, uid)
+
+script = os.environ.get("GS_ANNOUNCE", "")
+text = "The chat network restarts for maintenance in 2 minutes " + m.random(6)
+
+if script and os.path.isfile(script):
+    m.clearlog()
+    res = subprocess.run([sys.executable, script, "--host", "127.0.0.1", "--port", "5661", "--no-tls",
+                          "--oper", "netadmin", "--mask", "$*.test.net", "--message", text],
+                         input="test\n", capture_output=True, text=True, timeout=30)
+    print(res.stdout)
+    print(res.stderr)
+    if res.returncode != 0:
+        raise Exception("irc_announce.py failed with exit code %d" % res.returncode)
+    m.expect_all("every user gets the maintenance notice", r"NOTICE \$\*\.test\.net :.*" + text, timeout=10)
+
+    bad = subprocess.run([sys.executable, script, "--host", "127.0.0.1", "--port", "5661", "--no-tls",
+                          "--oper", "netadmin", "--mask", "$*.test.net", "--message", "should not arrive"],
+                         input="wrong-password\n", capture_output=True, text=True, timeout=30)
+    if bad.returncode == 0:
+        raise Exception("irc_announce.py must fail when OPER is refused")
+    print("\u2714 Test passed: irc_announce.py fails when OPER is refused")
+    m.wait(1)
+    m.not_expect_all("nothing is sent without oper", r"should not arrive")
+else:
+    print("GS_ANNOUNCE not set; sending the notice as an oper directly")
+    m.send(c3b, "OPER netadmin test")
+    m.clearlog()
+    m.send(c3b, "NOTICE $*.test.net :" + text)
+    m.expect_all("every user gets the maintenance notice", r"NOTICE \$\*\.test\.net :" + text, timeout=10, skip=c3b)

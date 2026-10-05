@@ -1,0 +1,46 @@
+#!/usr/bin/python3
+#
+# third/gameservices: the nick is the Blazium username. A logged-in user
+# cannot change it, and logging in while someone else holds the nick
+# disconnects the newcomer rather than the holder.
+#
+import irctestframework.irctest
+from irctestframework.gameservices import client as gs
+
+m = irctestframework.irctest.IrcTest()
+c1a = m.new('c1a')
+c1b = m.new('c1b')
+c2a = m.new('c2a')
+m.connect()
+gs.require_module(m, c1a)
+
+user = gs.username("locked")
+gs.login(m, c1a, user)
+
+m.clearlog()
+# Bypass IrcClient.out() so the framework keeps tracking the real nick.
+c1a.push(("NICK " + user + "x\r\n").encode())
+m.multisync()
+m.expect(c1a, "nick change refused", r" 432 \S+ " + user + r"x :.*Your nickname is your Blazium username", timeout=5)
+m.not_expect(c2a, "no NICK broadcast", r":" + user + r"!\S+ NICK ")
+
+m.clearlog()
+c1a.push(("NICK " + user.upper() + "\r\n").encode())
+m.multisync()
+m.expect(c1a, "case change refused too", r" 432 ", timeout=5)
+
+# Someone holds the account nick; a second client logs in as that account
+held = gs.username("held")
+m.send(c1b, "NICK " + held)
+m.expect(c1b, "c1b holds the nick", r"NICK :?" + held, timeout=5)
+m.sync = 0
+m.clearlog()
+c2a.out("GAMEAUTH " + gs.token(held, gs.new_token_id()))
+m.expect(c1b, "the holder sees the newcomer leave", r"QUIT :.*Nickname collision with your account name", timeout=10)
+del m.clients['c2a']
+c2a.close()
+m.sync = 1
+m.multisync()
+m.clearlog()
+m.send(c1b, "PING :holder-alive")
+m.expect(c1b, "holder still connected", r"PONG .*holder-alive", timeout=5)
