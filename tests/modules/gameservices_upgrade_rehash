@@ -4,8 +4,9 @@
 # previous build (GS_OLD_SO, built by run-suite from GS_OLD_SRC) is running
 # with users signed in and in game chats, the new .so is installed and the
 # network rehashes. Nobody may be disconnected, and logins, game tracking,
-# token ids and the nick lock must carry over. Channels made by the old
-# build get their +A binding at the next reconcile. A rollback to the old
+# token ids and the nick lock must carry over. A channel the old build left
+# unbound gets its +A binding at the next reconcile. A reload of the same
+# build keeps +A and does not send MODE again. A rollback to the old
 # build and forward again, with users in a game chat, must not crash or
 # lose that state either.
 #
@@ -111,7 +112,14 @@ try:
     if legacy:
         join_both("after the upgrade")
     else:
-        m.expect(c1b, "old channel is bound at the next reconcile", r"MODE " + chan + r" \+(AP|PA) " + uid, timeout=15)
+        # A same-build reload already restored +A. An older build left the
+        # channel unbound, so reconcile sends MODE. A 324 without +A does
+        # not match, and the wait still covers that later MODE.
+        m.send(c1b, "MODE " + chan)
+        m.expect(c1b, "old channel is bound at the next reconcile",
+                 r"(MODE " + chan + r" \+(AP|PA) " + uid +
+                 r"| 324 \S+ " + chan + r" \+\S*A\S* .*" + uid + r")",
+                 timeout=15)
     m.send(c1b, "WHOIS " + owner)
     m.expect(c1b, "synced game list rebuilt", r" 1830 \S+ " + owner + " " + uid + " owner :", timeout=10)
 
